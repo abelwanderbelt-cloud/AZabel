@@ -15,20 +15,8 @@ const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS || 9000);
 // Backends que o OnePlay Matrix 3.4.1 consulta como providers Stremio.
 const PROVIDERS = [
   {
-    key:'frost', name:'OnePlay • Frost', types:['movie','series'],
-    root:'https://froststream.cloutteam.com', mode:'imdb'
-  },
-  {
     key:'super', name:'OnePlay • SuperStream', types:['movie','series'],
     root:'https://da5f663b4690-superstream.baby-beamup.club', mode:'any'
-  },
-  {
-    key:'fenix', name:'OnePlay • FenixFlix', types:['movie','series'],
-    root:'https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd,cam%7Caudio=dublado,legendado%7Ccatalogs=populares_movie,populares_series,recentes_movie,recentes_series', mode:'imdb'
-  },
-  {
-    key:'bestcine', name:'OnePlay • BestCine', types:['movie','series'],
-    root:'https://bestcine.dpdns.org/qualities=4k,1080p,720p,sd,cam%7Ca=dub,leg,esp%7Ctv=none', mode:'imdb'
   },
   {
     key:'cotonet', name:'OnePlay • Cotonet', types:['movie'],
@@ -38,17 +26,17 @@ const PROVIDERS = [
 
 const manifest = {
   id: 'com.azabel.oneplay.bridge',
-  version: '3.0.0',
+  version: '3.1.0',
   name: 'OnePlay • Azabel',
-  description: 'Bridge do OnePlay para Stremio/Nuvio: agrega providers de filmes/séries e catálogo de TV ao vivo.',
+  description: 'Bridge do OnePlay para Stremio/Nuvio: SuperStream + Cotonet e TV ao vivo.',
   resources: [
-    {name:'stream', types:['movie','series','tv'], idPrefixes:['tt','tmdb:','live:']},
-    {name:'catalog', types:['tv']},
-    {name:'meta', types:['tv']}
+    {name:'stream', types:['movie','series','channel'], idPrefixes:['tt','tmdb:','live:']},
+    {name:'catalog', types:['channel']},
+    {name:'meta', types:['channel'], idPrefixes:['live:']}
   ],
-  types: ['movie','series','tv'],
+  types: ['movie','series','channel'],
   idPrefixes: ['tt','tmdb:','live:'],
-  catalogs: [{ type:'tv', id:'oneplay-live', name:'OnePlay • TV ao vivo' }],
+  catalogs: [{ type:'channel', id:'oneplay-live', name:'OnePlay • TV ao vivo' }],
   behaviorHints: { configurable:false }
 };
 
@@ -260,12 +248,12 @@ async function resolveLiveUrl(channel){
 }
 
 app.get('/',(_req,res)=>res.type('html').send(`
-<h2>OnePlay • Azabel v3 online</h2>
+<h2>OnePlay • Azabel v3.1 online</h2>
 <p><a href="/manifest.json">manifest.json</a></p>
 <p><a href="/health">health</a></p>`));
 
 app.get('/health',async (_req,res)=>{
-  res.json({ok:true,version:'3.0.0',providers:PROVIDERS.map(p=>p.key),liveApi:LIVE_API});
+  res.json({ok:true,version:'3.1.0',providers:PROVIDERS.map(p=>p.key),liveApi:LIVE_API});
 });
 app.get('/manifest.json',(_req,res)=>res.json(manifest));
 
@@ -276,7 +264,7 @@ app.get('/stream/:type/:id.json',async (req,res)=>{
     console.log(type,id,data.diagnostics);
     return res.json({streams:data.streams});
   }
-  if(type==='tv'){
+  if(type==='channel'||type==='tv'){
     const channels=await getLiveChannels();
     const ch=channels.find(x=>x.id===id);
     if(!ch) return res.json({streams:[]});
@@ -295,22 +283,27 @@ app.get('/stream/:type/:id.json',async (req,res)=>{
   res.json({streams:[]});
 });
 
-app.get('/catalog/tv/oneplay-live.json',async (_req,res)=>{
+async function liveCatalog(_req,res){
   const channels=await getLiveChannels();
   res.json({metas:channels.map(ch=>({
-    id:ch.id,type:'tv',name:ch.name,poster:ch.image||undefined,posterShape:'square',
+    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
     description:ch.category,genres:[ch.category]
   }))});
-});
+}
+app.get('/catalog/channel/oneplay-live.json', liveCatalog);
+// Alias antigo, útil para clientes que ainda consultem o tipo tv.
+app.get('/catalog/tv/oneplay-live.json', liveCatalog);
 
-app.get('/meta/tv/:id.json',async (req,res)=>{
+async function liveMeta(req,res){
   const channels=await getLiveChannels();
   const ch=channels.find(x=>x.id===req.params.id);
   res.json({meta:ch?{
-    id:ch.id,type:'tv',name:ch.name,poster:ch.image||undefined,posterShape:'square',
+    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
     description:ch.category,genres:[ch.category]
   }:null});
-});
+}
+app.get('/meta/channel/:id.json', liveMeta);
+app.get('/meta/tv/:id.json', liveMeta);
 
 // Diagnóstico opcional: mostra quantas fontes cada provider retornou sem expor URLs.
 app.get('/debug/:type/:id',async (req,res)=>{
@@ -319,4 +312,4 @@ app.get('/debug/:type/:id',async (req,res)=>{
   res.json({id:req.params.id,type:req.params.type,total:data.streams.length,providers:data.diagnostics});
 });
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel v3 listening on ${PORT}`));
+app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel v3.1 listening on ${PORT}`));
