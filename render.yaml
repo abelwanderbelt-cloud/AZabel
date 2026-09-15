@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: stremio-nuvio-bridge
+    name: stremio-nuvio-dynamic-bridge
     env: node
     plan: free
     buildCommand: npm install

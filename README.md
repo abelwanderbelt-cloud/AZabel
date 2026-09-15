@@ -1,82 +1,43 @@
-# Stremio/Nuvio Bridge — GitHub + Render
+# Azabel Streams v2 — Stremio / Nuvio
 
-Projeto Node.js pronto para subir no GitHub e publicar no Render.
+This is a dynamic Stremio-compatible bridge for **sources you are authorized to use**.
 
-## O que ele faz
+## What changed from v1
 
-- expõe `manifest.json` compatível com Stremio/Nuvio;
-- entrega streams de filmes e séries a partir de `data/streams.json`;
-- cria um catálogo de TV ao vivo a partir de `data/channels.json`;
-- não depende de Cloudflare Workers.
+v1 only read local example JSON files. v2 can query a real upstream stream API dynamically and can build a Live TV catalog from a remote M3U playlist.
 
-> Use apenas streams e APIs que você tenha autorização para acessar/distribuir.
+## Render setup
 
-## Subir no GitHub
+Replace the files in your GitHub repo with this folder and push. Render should redeploy automatically.
 
-1. Crie um repositório novo.
-2. Envie **todos os arquivos desta pasta** para a raiz do repositório.
-3. Faça commit.
+### Environment variables
 
-## Publicar no Render
+In Render -> your service -> Environment, add what you use:
 
-1. Entre no Render e escolha **New → Web Service**.
-2. Conecte o repositório do GitHub.
-3. O `render.yaml` já contém a configuração básica.
-4. Build command: `npm install`
-5. Start command: `npm start`
-6. Depois do deploy, use:
+- `STREAM_PROVIDER_URL` — HTTPS endpoint for your authorized stream provider. The bridge calls it with `?type=movie&id=tt...` or `?type=series&id=tt...:season:episode`.
+- `STREAM_PROVIDER_TOKEN` — optional bearer token for that API.
+- `LIVE_M3U_URL` — optional HTTPS URL to an M3U playlist you are authorized to access.
+- `UPSTREAM_TIMEOUT_MS` — optional; default `12000`.
+- `LIVE_CACHE_SECONDS` — optional; default `300`.
 
-   `https://SEU-SERVICO.onrender.com/manifest.json`
-
-no Stremio/Nuvio.
-
-## Adicionar um filme
-
-Em `data/streams.json`:
+The stream provider may return either:
 
 ```json
-{
-  "movie:tt0133093": [
-    {
-      "name": "Minha fonte",
-      "title": "1080p",
-      "url": "https://meu-servidor.exemplo/video.mp4"
-    }
-  ]
-}
+{"streams":[{"name":"Minha fonte","title":"1080p","url":"https://example.com/video.m3u8"}]}
 ```
 
-## Adicionar uma série
+or simply an array of those objects.
 
-O Stremio normalmente usa `IMDB:temporada:episodio` no ID do stream. Exemplo:
+## Install
 
-```json
-{
-  "series:tt0411008:1:1": [
-    {
-      "name": "Minha fonte",
-      "title": "S01E01",
-      "url": "https://meu-servidor.exemplo/episodio.m3u8"
-    }
-  ]
-}
-```
+After deploy, open:
 
-## Adicionar TV ao vivo
+`https://YOUR-SERVICE.onrender.com/health`
 
-Em `data/channels.json`:
+Then install:
 
-```json
-[
-  {
-    "id": "tv:meu-canal",
-    "name": "Meu Canal",
-    "poster": "https://.../logo.png",
-    "url": "https://.../live.m3u8"
-  }
-]
-```
+`https://YOUR-SERVICE.onrender.com/manifest.json`
 
-## Próximo passo
+## Important
 
-Se você tiver uma API ou lista M3U **autorizada**, dá para trocar os JSONs estáticos por carregamento dinâmico sem mudar a URL instalada no Stremio/Nuvio.
+This repository does not include scraping/resolution code for unlicensed third-party streaming sites. Plug in an API/M3U you own or are authorized to use.
