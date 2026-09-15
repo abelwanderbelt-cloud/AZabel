@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: stremio-nuvio-dynamic-bridge
+    name: azabel
     env: node
     plan: free
     buildCommand: npm install
