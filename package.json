@@ -1,9 +1,15 @@
 {
   "name": "azabel-oneplay-bridge",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "type": "commonjs",
-  "scripts": {"start": "node server.js"},
-  "engines": {"node": ">=20"},
-  "dependencies": {"express": "^4.21.2"}
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
 }
