@@ -1,0 +1,9 @@
+[
+  {
+    "id": "tv:exemplo",
+    "name": "Canal Exemplo",
+    "description": "Substitua por um canal/stream que você tenha autorização para usar.",
+    "poster": "https://dummyimage.com/600x600/111/fff.png&text=TV",
+    "url": "https://example.com/stream.m3u8"
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "movie:tt0000001": [
+    {
+      "name": "Minha fonte",
+      "title": "Exemplo autorizado",
+      "url": "https://example.com/video.mp4"
+    }
+  ],
+  "series:tt0000002:1:1": [
+    {
+      "name": "Minha fonte",
+      "title": "S01E01",
+      "url": "https://example.com/episode.mp4"
+    }
+  ]
+}
