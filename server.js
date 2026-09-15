@@ -1,18 +1,21 @@
 const express = require('express');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use((req,res,next)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Headers','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,OPTIONS');
   res.setHeader('Cache-Control','no-store');
+  if(req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 const UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36';
-const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS || 9000);
+const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS || 12000);
 
-// Backends que o OnePlay Matrix 3.4.1 consulta como providers Stremio.
+// Providers VOD mantidos da v4.
 const PROVIDERS = [
   {
     key:'super', name:'OnePlay • SuperStream', types:['movie','series'],
@@ -24,11 +27,17 @@ const PROVIDERS = [
   }
 ];
 
+// Fonte M3U usada pelo OnePlay Matrix 3.4.1.
+const LIVE_MASTER = process.env.LIVE_MASTER_URL || 'https://oneplayhd.com/listas_oneplay/master.txt';
+const LIVE_CACHE_MS = Number(process.env.LIVE_CACHE_MS || 10 * 60 * 1000);
+const MAX_LISTS = Number(process.env.LIVE_MAX_LISTS || 40);
+const MAX_CHANNELS = Number(process.env.LIVE_MAX_CHANNELS || 2500);
+
 const manifest = {
   id: 'com.azabel.oneplay.bridge',
-  version: '4.0.0',
+  version: '4.1.0',
   name: 'OnePlay • Azabel',
-  description: 'Bridge do OnePlay para Stremio/Nuvio: SuperStream + Cotonet e canais ao vivo.',
+  description: 'Bridge do OnePlay para Stremio/Nuvio: SuperStream + Cotonet e canais M3U.',
   resources: [
     {name:'stream', types:['movie','series','channel'], idPrefixes:['tt','tmdb:','live:']},
     {name:'catalog', types:['channel']},
@@ -87,7 +96,6 @@ function streamKey(s){
 
 function normalizeProviderStream(raw, provider, idx){
   if(!raw || typeof raw !== 'object') return null;
-  // Mantém o contrato Stremio original (URL, torrent, externalUrl, behaviorHints etc.).
   const s = {...raw};
   const originalName = safeText(raw.name);
   const originalTitle = safeText(raw.title || raw.description);
@@ -126,155 +134,154 @@ async function aggregateStreams(type, rawId){
   return {streams:out, diagnostics:results.map(x=>({provider:x.provider,ok:x.ok,count:x.streams.length,reason:x.reason||''}))};
 }
 
-// ---------------- TV AO VIVO (mesma fonte usada pelo OnePlay Live) ----------------
-const LIVE_API='https://embedtv.lat/api/channels';
-const LIVE_REFERER='https://w7.embedtv.lat/';
-const API_REFERER='https://embedtv.lat/';
-const CAT_NAMES={1:'Esportes',2:'Infantil',3:'Documentários',4:'Filmes e Séries',5:'Notícias',6:'TV Aberta',7:'Variedades',9:'Portugal'};
-let liveCache={at:0,channels:[]};
+// ---------------- TV AO VIVO via master.txt -> M3U ----------------
+let liveCache = { at:0, lists:[], channels:[], byId:new Map(), errors:[] };
 
-function normalizeLivePayload(payload){
-  if(!payload || !Array.isArray(payload.channels)) return [];
-  const cmap={};
-  for(const c of (payload.categories||[])){
-    const n=Number(c?.id); if(n) cmap[n]=CAT_NAMES[n] || safeText(c?.name);
+function attr(line, name){
+  const re = new RegExp(`${name}="([^"]*)"`, 'i');
+  const m = line.match(re);
+  return m ? safeText(m[1]) : '';
+}
+
+function stableLiveId(group, name, streamUrl){
+  const raw = `${group}\x1f${name}\x1f${streamUrl}`;
+  return 'live:' + crypto.createHash('sha256').update(raw).digest('base64url').slice(0,24);
+}
+
+function splitKodiHeaders(raw){
+  const line = safeText(raw);
+  const pos = line.indexOf('|');
+  if(pos < 0) return {url:line, headers:{}};
+  const url = line.slice(0,pos);
+  const query = line.slice(pos+1);
+  const headers = {};
+  for(const part of query.split('&')){
+    const eq = part.indexOf('=');
+    if(eq < 1) continue;
+    let k = part.slice(0,eq), v = part.slice(eq+1);
+    try{k=decodeURIComponent(k)}catch{}
+    try{v=decodeURIComponent(v)}catch{}
+    if(k && v) headers[k]=v;
   }
-  return payload.channels.map(ch=>{
-    const id=safeText(ch?.id); if(!id) return null;
-    let category='Outros';
-    if(id.startsWith('24h_')) category='24 Horas';
-    else if(id.startsWith('pt_')) category='Portugal';
-    else if(['playboy','sexyhot'].includes(id)) category='Adulto';
-    else {
-      const first=(ch?.categories||[]).map(Number).find(x=>cmap[x]);
-      if(first) category=cmap[first];
+  return {url,headers};
+}
+
+function parseM3U(text, sourceUrl){
+  const out=[];
+  let current=null;
+  for(const raw of String(text||'').split(/\r?\n/)){
+    const line=raw.trim();
+    if(!line) continue;
+    if(line.startsWith('#EXTINF')){
+      const comma=line.lastIndexOf(',');
+      const name=safeText(comma>=0 ? line.slice(comma+1) : '') || attr(line,'tvg-name') || 'Canal';
+      current={
+        name,
+        group:attr(line,'group-title') || 'Outros',
+        logo:attr(line,'tvg-logo'),
+        tvgId:attr(line,'tvg-id'),
+        tvgName:attr(line,'tvg-name') || name,
+        sourceUrl
+      };
+      continue;
     }
-    return {
-      id:`live:${id}`,
-      sourceId:id,
-      name:safeText(ch?.name)||id,
-      category,
-      image:safeText(ch?.image)||safeText(ch?.preview),
-      apiUrl:safeText(ch?.url)
-    };
-  }).filter(Boolean);
+    if(current && /^https?:\/\//i.test(line)){
+      const {url,headers}=splitKodiHeaders(line);
+      if(url){
+        current.streamUrl=url;
+        current.headers=headers;
+        current.id=stableLiveId(current.group,current.tvgId || current.tvgName || current.name,line);
+        out.push(current);
+      }
+      current=null;
+    }
+  }
+  return out;
 }
 
-async function getLiveChannels(){
-  if(Date.now()-liveCache.at < 5*60*1000 && liveCache.channels.length) return liveCache.channels;
+async function fetchText(url){
+  const r=await fetchWithTimeout(url,{headers:{Accept:'text/plain,application/x-mpegURL,application/vnd.apple.mpegurl,*/*'}});
+  if(!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.text();
+}
+
+async function refreshLive(force=false){
+  if(!force && liveCache.channels.length && Date.now()-liveCache.at < LIVE_CACHE_MS) return liveCache;
+  const errors=[];
+  let lists=[];
   try{
-    const r=await fetchWithTimeout(LIVE_API,{headers:{Referer:API_REFERER,Accept:'application/json'}});
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const channels=normalizeLivePayload(await r.json());
-    if(channels.length) liveCache={at:Date.now(),channels};
-  }catch(e){ console.error('live catalog:',e.message); }
-  return liveCache.channels;
-}
-
-function unescapeHtmlText(text){
-  return safeText(text)
-    .replace(/\\\//g,'/').replace(/\\u002[fF]/g,'/').replace(/\\u003[aA]/g,':')
-    .replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
-}
-
-function absolutize(base,target){
-  try { return new URL(target,base).toString(); } catch { return ''; }
-}
-
-function mediaCandidates(base,text){
-  const clean=unescapeHtmlText(text); const found=[];
-  const push=v=>{ v=safeText(v).replace(/[);,\]]+$/,''); if(v && !found.includes(v)) found.push(v); };
-  for(const m of clean.matchAll(/https?:\/\/[^\s"'<>]+/gi)) push(m[0]);
-  for(const m of clean.matchAll(/(?<!:)\/\/[^\s"'<>]+/gi)) push('https:'+m[0]);
-  for(const m of clean.matchAll(/["'](\/[^"']+)["']/gi)) push(absolutize(base,m[1]));
-  const scored=found.map((u,i)=>{
-    let p; try{p=new URL(u)}catch{return null}
-    const host=p.hostname.toLowerCase(), path=p.pathname.toLowerCase();
-    const file=path.endsWith('file.txt'); const m3u8=path.endsWith('.m3u8')||u.toLowerCase().includes('.m3u8?');
-    let rank=99;
-    if(file && host.endsWith('cloudfront-net.lat')) rank=0;
-    else if(m3u8 && host.endsWith('cloudfront-net.lat')) rank=1;
-    else if(m3u8 && host.endsWith('embedtv.lat')) rank=2;
-    else if(m3u8) rank=3;
-    return rank<99?{u,rank,i}:null;
-  }).filter(Boolean).sort((a,b)=>a.rank-b.rank||a.i-b.i);
-  return scored.slice(0,12).map(x=>x.u);
-}
-
-function iframeCandidates(base,text){
-  const clean=unescapeHtmlText(text), out=[];
-  for(const m of clean.matchAll(/<iframe[^>]+src\s*=\s*["']([^"']+)["']/gi)){
-    const u=absolutize(base,m[1]);
-    try{ const h=new URL(u).hostname.toLowerCase(); if(h==='embedtv.lat'||h.endsWith('.embedtv.lat')) out.push(u); }catch{}
+    const master = await fetchText(LIVE_MASTER);
+    lists = master.split(/\r?\n/).map(x=>x.trim()).filter(x=>/^https?:\/\//i.test(x));
+    lists = [...new Set(lists)].slice(0,MAX_LISTS);
+  }catch(e){
+    errors.push(`master: ${e.message}`);
+    if(liveCache.channels.length) return liveCache;
+    liveCache={at:Date.now(),lists:[],channels:[],byId:new Map(),errors};
+    return liveCache;
   }
-  return [...new Set(out)].slice(0,4);
+
+  const results = await Promise.allSettled(lists.map(async url=>({url,text:await fetchText(url)})));
+  const channels=[];
+  for(const r of results){
+    if(r.status==='fulfilled'){
+      channels.push(...parseM3U(r.value.text,r.value.url));
+      if(channels.length>=MAX_CHANNELS) break;
+    }else{
+      errors.push(safeText(r.reason?.message || r.reason || 'erro M3U'));
+    }
+  }
+
+  const dedup=[]; const seen=new Set();
+  for(const ch of channels.slice(0,MAX_CHANNELS)){
+    const key=`${ch.name}|${ch.streamUrl}`;
+    if(seen.has(key)) continue;
+    seen.add(key); dedup.push(ch);
+  }
+  const byId=new Map(dedup.map(ch=>[ch.id,ch]));
+  liveCache={at:Date.now(),lists,channels:dedup,byId,errors};
+  return liveCache;
 }
 
-async function resolveLiveUrl(channel){
-  const headers={Referer:LIVE_REFERER,Origin:'https://w7.embedtv.lat',Accept:'*/*'};
-  const starts=[];
-  if(channel.apiUrl) starts.push(channel.apiUrl);
-  starts.push(`https://w7.embedtv.lat/${encodeURIComponent(channel.sourceId)}`);
-  const visited=new Set();
-  async function probe(url,depth=0){
-    if(!url || visited.has(url) || depth>2) return null; visited.add(url);
-    try{
-      const r=await fetchWithTimeout(url,{headers});
-      if(!r.ok) return null;
-      const final=r.url||url;
-      const ct=(r.headers.get('content-type')||'').toLowerCase();
-      const text=await r.text();
-      if(text.includes('#EXTM3U') || final.toLowerCase().includes('.m3u8') || final.toLowerCase().endsWith('file.txt')){
-        return {url:final,headers};
-      }
-      for(const candidate of mediaCandidates(final,text)){
-        // Não baixa segmentos; apenas seleciona o endpoint que o player abrirá.
-        try{
-          const cr=await fetchWithTimeout(candidate,{headers});
-          if(!cr.ok) continue;
-          const body=await cr.text();
-          if(body.includes('#EXTM3U') || candidate.toLowerCase().includes('.m3u8') || candidate.toLowerCase().endsWith('file.txt'))
-            return {url:cr.url||candidate,headers};
-        }catch{}
-      }
-      for(const page of iframeCandidates(final,text)){
-        const nested=await probe(page,depth+1); if(nested) return nested;
-      }
-    }catch{}
-    return null;
-  }
-  for(const u of starts){ const got=await probe(u); if(got) return got; }
-  return null;
+function channelMeta(ch){
+  return {
+    id:ch.id,
+    type:'channel',
+    name:ch.name,
+    poster:ch.logo || undefined,
+    posterShape:'square',
+    description:`Canal ao vivo • ${ch.group}`,
+    genres:[ch.group],
+    behaviorHints:{defaultVideoId:ch.id}
+  };
 }
 
 app.get('/',(_req,res)=>res.type('html').send(`
-<h2>OnePlay • Azabel FINAL v4.0 online</h2>
+<h2>OnePlay • Azabel v4.1 online</h2>
 <p><a href="/manifest.json">manifest.json</a></p>
-<p><a href="/health">health</a></p>`));
+<p><a href="/health">health</a></p>
+<p><a href="/debug/live">debug live</a></p>`));
 
 app.get('/health',async (_req,res)=>{
-  res.json({ok:true,version:'4.0.0',providers:PROVIDERS.map(p=>p.key),liveApi:LIVE_API});
+  res.json({ok:true,version:'4.1.0',providers:PROVIDERS.map(p=>p.key),liveMaster:LIVE_MASTER});
 });
 app.get('/manifest.json',(_req,res)=>res.json(manifest));
 
 app.get('/stream/:type/:id.json',async (req,res)=>{
   const {type,id}=req.params;
 
-  // Canais ao vivo anunciados nativamente como type=channel.
-  if((type==='movie'||type==='channel'||type==='tv') && id.startsWith('live:')){
-    const channels=await getLiveChannels();
-    const ch=channels.find(x=>x.id===id);
+  if(type==='channel' && id.startsWith('live:')){
+    const live=await refreshLive(false);
+    const ch=live.byId.get(id);
     if(!ch) return res.json({streams:[]});
-    const resolved=await resolveLiveUrl(ch);
-    if(!resolved) return res.json({streams:[]});
+    const behaviorHints={notWebReady:true};
+    if(ch.headers && Object.keys(ch.headers).length){
+      behaviorHints.proxyHeaders={request:ch.headers};
+    }
     return res.json({streams:[{
-      name:'OnePlay • Canais ao vivo',
-      title:`${ch.name} • ${ch.category}`,
-      url:resolved.url,
-      behaviorHints:{
-        notWebReady:true,
-        proxyHeaders:{request:resolved.headers}
-      }
+      name:'OnePlay • Ao vivo',
+      title:`${ch.name} • ${ch.group}`,
+      url:ch.streamUrl,
+      behaviorHints
     }]});
   }
 
@@ -286,36 +293,34 @@ app.get('/stream/:type/:id.json',async (req,res)=>{
   res.json({streams:[]});
 });
 
-async function liveCatalog(_req,res){
-  const channels=await getLiveChannels();
-  res.json({metas:channels.map(ch=>({
-    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
-    description:`Canal ao vivo • ${ch.category}`,genres:[ch.category]
-  }))});
-}
-app.get('/catalog/movie/oneplay-live.json', liveCatalog);
-// Aliases antigos mantidos apenas por compatibilidade; o manifest anuncia channel.
-app.get('/catalog/channel/oneplay-live.json', liveCatalog);
-app.get('/catalog/tv/oneplay-live.json', liveCatalog);
+app.get('/catalog/channel/oneplay-live.json',async (_req,res)=>{
+  const live=await refreshLive(false);
+  res.json({metas:live.channels.map(channelMeta)});
+});
 
-async function liveMeta(req,res){
-  const channels=await getLiveChannels();
-  const ch=channels.find(x=>x.id===req.params.id);
-  res.json({meta:ch?{
-    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
-    description:`Canal ao vivo • ${ch.category}`,genres:[ch.category],
-    behaviorHints:{defaultVideoId:ch.id}
-  }:null});
-}
-app.get('/meta/movie/:id.json', liveMeta);
-app.get('/meta/channel/:id.json', liveMeta);
-app.get('/meta/tv/:id.json', liveMeta);
+app.get('/meta/channel/:id.json',async (req,res)=>{
+  const live=await refreshLive(false);
+  const ch=live.byId.get(req.params.id);
+  res.json({meta:ch ? channelMeta(ch) : null});
+});
 
-// Diagnóstico opcional: mostra quantas fontes cada provider retornou sem expor URLs.
 app.get('/debug/:type/:id',async (req,res)=>{
   if(!['movie','series'].includes(req.params.type)) return res.status(400).json({error:'tipo inválido'});
   const data=await aggregateStreams(req.params.type,req.params.id);
   res.json({id:req.params.id,type:req.params.type,total:data.streams.length,providers:data.diagnostics});
 });
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel FINAL v4.0 listening on ${PORT}`));
+app.get('/debug/live',async (_req,res)=>{
+  const live=await refreshLive(true);
+  res.json({
+    ok:live.channels.length>0,
+    master:LIVE_MASTER,
+    lists:live.lists.length,
+    channels:live.channels.length,
+    groups:[...new Set(live.channels.map(x=>x.group))].slice(0,100),
+    errors:live.errors.slice(0,10),
+    sample:live.channels.slice(0,5).map(x=>({id:x.id,name:x.name,group:x.group,hasLogo:!!x.logo,hasHeaders:Object.keys(x.headers||{}).length>0}))
+  });
+});
+
+app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel v4.1 listening on ${PORT}`));
