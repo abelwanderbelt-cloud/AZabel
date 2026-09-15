@@ -26,17 +26,17 @@ const PROVIDERS = [
 
 const manifest = {
   id: 'com.azabel.oneplay.bridge',
-  version: '3.1.0',
+  version: '3.2.0',
   name: 'OnePlay • Azabel',
-  description: 'Bridge do OnePlay para Stremio/Nuvio: SuperStream + Cotonet e TV ao vivo.',
+  description: 'Bridge do OnePlay para Stremio/Nuvio: SuperStream + Cotonet e TV ao vivo em catálogo de filmes.',
   resources: [
-    {name:'stream', types:['movie','series','channel'], idPrefixes:['tt','tmdb:','live:']},
-    {name:'catalog', types:['channel']},
-    {name:'meta', types:['channel'], idPrefixes:['live:']}
+    {name:'stream', types:['movie','series'], idPrefixes:['tt','tmdb:','live:']},
+    {name:'catalog', types:['movie']},
+    {name:'meta', types:['movie'], idPrefixes:['live:']}
   ],
-  types: ['movie','series','channel'],
+  types: ['movie','series'],
   idPrefixes: ['tt','tmdb:','live:'],
-  catalogs: [{ type:'channel', id:'oneplay-live', name:'OnePlay • TV ao vivo' }],
+  catalogs: [{ type:'movie', id:'oneplay-live', name:'OnePlay • TV ao vivo' }],
   behaviorHints: { configurable:false }
 };
 
@@ -248,23 +248,21 @@ async function resolveLiveUrl(channel){
 }
 
 app.get('/',(_req,res)=>res.type('html').send(`
-<h2>OnePlay • Azabel v3.1 online</h2>
+<h2>OnePlay • Azabel v3.2 online</h2>
 <p><a href="/manifest.json">manifest.json</a></p>
 <p><a href="/health">health</a></p>`));
 
 app.get('/health',async (_req,res)=>{
-  res.json({ok:true,version:'3.1.0',providers:PROVIDERS.map(p=>p.key),liveApi:LIVE_API});
+  res.json({ok:true,version:'3.2.0',providers:PROVIDERS.map(p=>p.key),liveApi:LIVE_API});
 });
 app.get('/manifest.json',(_req,res)=>res.json(manifest));
 
 app.get('/stream/:type/:id.json',async (req,res)=>{
   const {type,id}=req.params;
-  if(type==='movie'||type==='series'){
-    const data=await aggregateStreams(type,id);
-    console.log(type,id,data.diagnostics);
-    return res.json({streams:data.streams});
-  }
-  if(type==='channel'||type==='tv'){
+
+  // Os canais são anunciados como "movie" só para o Stremio exibir o catálogo.
+  // IDs live:* continuam sendo resolvidos como transmissão ao vivo.
+  if((type==='movie'||type==='channel'||type==='tv') && id.startsWith('live:')){
     const channels=await getLiveChannels();
     const ch=channels.find(x=>x.id===id);
     if(!ch) return res.json({streams:[]});
@@ -280,28 +278,37 @@ app.get('/stream/:type/:id.json',async (req,res)=>{
       }
     }]});
   }
+
+  if(type==='movie'||type==='series'){
+    const data=await aggregateStreams(type,id);
+    console.log(type,id,data.diagnostics);
+    return res.json({streams:data.streams});
+  }
   res.json({streams:[]});
 });
 
 async function liveCatalog(_req,res){
   const channels=await getLiveChannels();
   res.json({metas:channels.map(ch=>({
-    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
-    description:ch.category,genres:[ch.category]
+    id:ch.id,type:'movie',name:ch.name,poster:ch.image||undefined,posterShape:'square',
+    description:`TV ao vivo • ${ch.category}`,genres:[ch.category]
   }))});
 }
+app.get('/catalog/movie/oneplay-live.json', liveCatalog);
+// Aliases mantidos para teste/compatibilidade, embora o manifest anuncie movie.
 app.get('/catalog/channel/oneplay-live.json', liveCatalog);
-// Alias antigo, útil para clientes que ainda consultem o tipo tv.
 app.get('/catalog/tv/oneplay-live.json', liveCatalog);
 
 async function liveMeta(req,res){
   const channels=await getLiveChannels();
   const ch=channels.find(x=>x.id===req.params.id);
   res.json({meta:ch?{
-    id:ch.id,type:'channel',name:ch.name,poster:ch.image||undefined,posterShape:'square',
-    description:ch.category,genres:[ch.category]
+    id:ch.id,type:'movie',name:ch.name,poster:ch.image||undefined,posterShape:'square',
+    description:`TV ao vivo • ${ch.category}`,genres:[ch.category],
+    behaviorHints:{defaultVideoId:ch.id}
   }:null});
 }
+app.get('/meta/movie/:id.json', liveMeta);
 app.get('/meta/channel/:id.json', liveMeta);
 app.get('/meta/tv/:id.json', liveMeta);
 
@@ -312,4 +319,4 @@ app.get('/debug/:type/:id',async (req,res)=>{
   res.json({id:req.params.id,type:req.params.type,total:data.streams.length,providers:data.diagnostics});
 });
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel v3.1 listening on ${PORT}`));
+app.listen(PORT,'0.0.0.0',()=>console.log(`OnePlay Azabel v3.2 listening on ${PORT}`));
