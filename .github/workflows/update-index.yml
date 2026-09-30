@@ -24,7 +24,7 @@ jobs:
       - name: Build index
         env:
           M3U_URL: ${{ secrets.M3U_URL }}
-        run: node scripts/build-index.mjs
+        run: node build-index.mjs
 
       - name: Commit index
         run: |
