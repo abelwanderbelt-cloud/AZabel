@@ -2,6 +2,7 @@ name: Update Eagle Click index
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "17 */6 * * *"
 
@@ -9,27 +10,42 @@ permissions:
   contents: write
 
 jobs:
-  update:
+  update-index:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Build index
+      - name: Build Eagle Click index
         env:
           M3U_URL: ${{ secrets.M3U_URL }}
         run: node build-index.mjs
+
+      - name: Show generated files
+        run: |
+          echo "Arquivos gerados:"
+          find eagle-index -maxdepth 2 -type f | sort
+
+          echo ""
+          echo "Manifest:"
+          cat eagle-index/manifest.json
 
       - name: Commit index
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add eagle-index
-          git diff --cached --quiet || git commit -m "Update Eagle Click index"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteração no índice."
+          else
+            git commit -m "Update Eagle Click index"
+            git push
+          fi
