@@ -1,313 +1,1397 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import fs from "node:fs/promises";
+import path from "node:path";
 
-const M3U_URL = process.env.M3U_URL;
-const OUTPUT_DIR = process.env.OUTPUT_DIR || "eagle-index";
+/*
+ * =========================================================
+ * EAGLE CLICK - INDEX BUILDER
+ * =========================================================
+ *
+ * Entrada:
+ *   M3U_URL (GitHub Secret)
+ *
+ * Saída:
+ *   eagle-index/
+ *   ├── manifest.json
+ *   ├── catalog.json
+ *   └── shards/
+ *       ├── 00.json
+ *       ├── 01.json
+ *       └── ...
+ *       └── ff.json
+ *
+ * IMPORTANTE:
+ * - Não grava username/password no índice.
+ * - Guarda apenas o ID Xtream e metadados necessários.
+ * - O Worker reconstrói a URL do stream usando as credenciais.
+ */
+
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const M3U_URL =
+  process.env.M3U_URL;
 
 if (!M3U_URL) {
-  throw new Error("M3U_URL não foi configurada como GitHub Secret.");
+  throw new Error(
+    "M3U_URL não foi configurada no GitHub Secrets."
+  );
 }
 
-const MAX_TOKEN_ITEMS = 300;
-const SHARD_COUNT = 256;
+const OUTPUT_DIR =
+  path.resolve(
+    "eagle-index"
+  );
 
-const STOP_WORDS = new Set([
-  "a", "o", "as", "os", "um", "uma", "uns", "umas",
-  "de", "da", "do", "das", "dos", "e", "em", "no", "na",
-  "nos", "nas", "por", "para", "com", "sem", "the", "an",
-  "of", "and", "in", "on", "to", "for", "with", "from"
-]);
+const SHARDS_DIR =
+  path.join(
+    OUTPUT_DIR,
+    "shards"
+  );
 
-function normalizeCore(text) {
-  return String(text || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\[[^\]]*\]/g, " ")
-    .replace(/\((?:[^)]*(?:2160p|1080p|720p|480p|4k|uhd|fhd|hd|sd|dublado|dub|dual|legendado|leg|sub|pt[- ]?br|original)[^)]*)\)/gi, " ")
-    .replace(/\b(2160p|2160|4k|uhd|1080p|1080|fhd|720p|720|hd|480p|480|sd)\b/gi, " ")
-    .replace(/\b(dual\s*audio|dual|dublado|dub|legendado|leg|subtitled|sub|pt[- ]?br|portugu(?:e|ê)s|original|english)\b/gi, " ")
-    .replace(/\b(19|20)\d{2}\b/g, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
+const MAX_M3U_RETRIES = 6;
+
+/* =========================================================
+   UTILS
+========================================================= */
+
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
+
+function normalizeBaseUrl(
+  value
+) {
+  try {
+    const u =
+      new URL(
+        value
+      );
+
+    return u.origin;
+  } catch (_) {
+    return "";
+  }
+}
+
+function cleanText(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .replace(
+      /<!\[CDATA\[([\s\S]*?)\]\]>/g,
+      "$1"
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+    .replace(
+      /&gt;/gi,
+      ">"
+    )
     .trim();
 }
 
-function fnv1a(value) {
-  let hash = 0x811c9dc5;
-  const s = String(value || "");
-  for (let i = 0; i < s.length; i++) {
-    hash ^= s.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
+function normalizeSearch(
+  text
+) {
+  return cleanText(
+    text
+  )
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /\[[^\]]*\]/g,
+      " "
+    )
+    .replace(
+      /\([^)]*(?:2160p|1080p|720p|480p|4k|uhd|fhd|hd|sd|dublado|dub|dual|legendado|leg|sub|original|pt[- ]?br)[^)]*\)/gi,
+      " "
+    )
+    .replace(
+      /\b(?:2160p|2160|4k|uhd|1080p|1080|fhd|720p|720|hd|480p|480|sd)\b/gi,
+      " "
+    )
+    .replace(
+      /\b(?:dual\s*audio|dual|dublado|dub|legendado|leg|subtitled|sub|original|portugues|portugu[eê]s|english|pt[- ]?br)\b/gi,
+      " "
+    )
+    .replace(
+      /\b(?:19|20)\d{2}\b/g,
+      " "
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function getTokens(
+  text
+) {
+  return [
+    ...new Set(
+      normalizeSearch(
+        text
+      )
+        .split(" ")
+        .filter(
+          token =>
+            token.length >= 2
+        )
+    )
+  ];
+}
+
+function qualityLabel(
+  text
+) {
+  const n =
+    cleanText(
+      text
+    )
+      .normalize("NFD")
+      .replace(
+        /[\u0300-\u036f]/g,
+        ""
+      )
+      .toLowerCase();
+
+  if (
+    /\b(?:2160p|2160|4k|uhd)\b/.test(
+      n
+    )
+  ) {
+    return "4K";
   }
+
+  if (
+    /\b(?:1080p|1080|fhd)\b/.test(
+      n
+    )
+  ) {
+    return "1080p";
+  }
+
+  if (
+    /\b(?:720p|720|hd)\b/.test(
+      n
+    )
+  ) {
+    return "720p";
+  }
+
+  if (
+    /\b(?:480p|480|sd)\b/.test(
+      n
+    )
+  ) {
+    return "480p";
+  }
+
+  return "";
+}
+
+function audioLabel(
+  text
+) {
+  const n =
+    cleanText(
+      text
+    )
+      .normalize("NFD")
+      .replace(
+        /[\u0300-\u036f]/g,
+        ""
+      )
+      .toLowerCase();
+
+  if (
+    /\bdual\s*audio\b/.test(
+      n
+    ) ||
+    /\bdual\b/.test(
+      n
+    )
+  ) {
+    return "Dual Áudio";
+  }
+
+  if (
+    /\bdublado\b/.test(
+      n
+    ) ||
+    /\bdub\b/.test(
+      n
+    ) ||
+    /\bpt[- ]?br\b/.test(
+      n
+    ) ||
+    /\bportugues\b/.test(
+      n
+    )
+  ) {
+    return "Dublado";
+  }
+
+  if (
+    /\blegendado\b/.test(
+      n
+    ) ||
+    /\bleg\b/.test(
+      n
+    ) ||
+    /\bsubtitled\b/.test(
+      n
+    ) ||
+    /\bsub\b/.test(
+      n
+    )
+  ) {
+    return "Legendado";
+  }
+
+  if (
+    /\boriginal\b/.test(
+      n
+    ) ||
+    /\benglish\b/.test(
+      n
+    )
+  ) {
+    return "Original";
+  }
+
+  return "";
+}
+
+function parseAttribute(
+  line,
+  attribute
+) {
+  const regex =
+    new RegExp(
+      `${attribute}="([^"]*)"`,
+      "i"
+    );
+
+  return cleanText(
+    line.match(
+      regex
+    )?.[1] || ""
+  );
+}
+
+function parseExtInf(
+  line
+) {
+  const comma =
+    line.indexOf(
+      ","
+    );
+
+  let name =
+    comma >= 0
+      ? line
+          .slice(
+            comma + 1
+          )
+          .trim()
+      : "";
+
+  if (!name) {
+    name =
+      parseAttribute(
+        line,
+        "tvg-name"
+      );
+  }
+
+  return {
+    name:
+      cleanText(
+        name
+      ),
+    tvgName:
+      parseAttribute(
+        line,
+        "tvg-name"
+      ),
+    logo:
+      parseAttribute(
+        line,
+        "tvg-logo"
+      ),
+    group:
+      parseAttribute(
+        line,
+        "group-title"
+      ),
+    tvgId:
+      parseAttribute(
+        line,
+        "tvg-id"
+      )
+  };
+}
+
+/* =========================================================
+   HASH
+========================================================= */
+
+function fnv1a(
+  value
+) {
+  let hash =
+    0x811c9dc5;
+
+  const text =
+    String(
+      value || ""
+    );
+
+  for (
+    let i = 0;
+    i < text.length;
+    i++
+  ) {
+    hash ^=
+      text.charCodeAt(i);
+
+    hash =
+      Math.imul(
+        hash,
+        0x01000193
+      );
+  }
+
   return hash >>> 0;
 }
 
-function shardFor(value) {
-  return (fnv1a(value) & 0xff).toString(16).padStart(2, "0");
+function shardFor(
+  value
+) {
+  return (
+    fnv1a(
+      value
+    ) & 0xff
+  )
+    .toString(16)
+    .padStart(
+      2,
+      "0"
+    );
 }
 
-function parseAttr(line, name) {
-  const match = line.match(
-    new RegExp(`${name}="([^"]*)"`, "i")
-  );
-  return match?.[1] || "";
-}
+/* =========================================================
+   STREAM ID
+========================================================= */
 
-function parseExtinf(line) {
-  const comma = line.indexOf(",");
-  return {
-    name:
-      (comma >= 0 ? line.slice(comma + 1).trim() : "") ||
-      parseAttr(line, "tvg-name") ||
-      "Filme",
-    poster: parseAttr(line, "tvg-logo"),
-    group: parseAttr(line, "group-title")
-  };
-}
-
-function qualityOf(name) {
-  const n = String(name || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-
-  if (/\b(2160p|2160|4k|uhd)\b/.test(n)) return "4K";
-  if (/\b(1080p|1080|fhd)\b/.test(n)) return "1080p";
-  if (/\b(720p|720|hd)\b/.test(n)) return "720p";
-  if (/\b(480p|480|sd)\b/.test(n)) return "480p";
-  return "";
-}
-
-function audioOf(name) {
-  const n = String(name || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-
-  if (/\bdual\s*audio\b|\bdual\b/.test(n)) return "Dual Áudio";
-  if (/\bdublado\b|\bdub\b|\bpt[- ]?br\b|\bportugues\b/.test(n)) return "Dublado";
-  if (/\blegendado\b|\bleg\b|\bsubtitled\b|\bsub\b/.test(n)) return "Legendado";
-  if (/\boriginal\b|\benglish\b/.test(n)) return "Original";
-  return "";
-}
-
-function yearOf(name) {
-  const match = String(name || "").match(/\b(19|20)\d{2}\b/);
-  return match ? match[0] : "";
-}
-
-function extractPathInfo(streamUrl) {
+function extractStreamId(
+  streamUrl
+) {
   try {
-    const u = new URL(streamUrl);
-    const parts = u.pathname.split("/").filter(Boolean);
-    const file = parts.at(-1) || "";
-    const slashIndex = parts.findIndex(x => x.toLowerCase() === "movie");
+    const u =
+      new URL(
+        streamUrl
+      );
 
-    if (slashIndex < 0) return null;
+    /*
+     * /movie/user/pass/12345.mp4
+     */
+    const parts =
+      u.pathname
+        .split("/")
+        .filter(Boolean);
 
-    const match = file.match(/^(.+?)\.([^.\/]+)$/);
-    if (!match) return null;
+    const movieIndex =
+      parts.findIndex(
+        p =>
+          p.toLowerCase() ===
+          "movie"
+      );
 
-    return {
-      id: decodeURIComponent(match[1]),
-      extension: match[2].toLowerCase()
-    };
+    if (
+      movieIndex >= 0 &&
+      parts[movieIndex + 3]
+    ) {
+      return parts[
+        movieIndex + 3
+      ].replace(
+        /\.[^.]+$/,
+        ""
+      );
+    }
+
+    /*
+     * Fallback: último segmento numérico.
+     */
+    const last =
+      parts.at(-1) || "";
+
+    const numeric =
+      last.match(
+        /^(\d+)/
+      );
+
+    if (
+      numeric
+    ) {
+      return numeric[1];
+    }
+
+    /*
+     * Último recurso:
+     * hash da URL.
+     */
+    return String(
+      fnv1a(
+        streamUrl
+      )
+    );
   } catch (_) {
-    return null;
+    return String(
+      fnv1a(
+        streamUrl
+      )
+    );
   }
 }
 
-function compactRecord(raw) {
-  return {
-    i: raw.id,
-    t: "movie",
-    n: raw.name,
-    p: raw.poster || "",
-    q: raw.quality || "",
-    a: raw.audio || "",
-    e: raw.extension || "mp4",
-    y: raw.year || ""
-  };
+/* =========================================================
+   YEAR
+========================================================= */
+
+function extractYear(
+  name
+) {
+  const match =
+    String(
+      name || ""
+    ).match(
+      /\b((?:19|20)\d{2})\b/
+    );
+
+  return match
+    ? match[1]
+    : "";
 }
 
-function addToMapOfArrays(map, key, record, limit = Infinity) {
-  if (!key) return;
-  let array = map.get(key);
-  if (!array) {
-    array = [];
-    map.set(key, array);
-  }
+/* =========================================================
+   M3U URL VARIANTS
+========================================================= */
 
-  if (!array.some(x => x.i === record.i)) {
-    if (array.length < limit) array.push(record);
-  }
-}
+function makeUrlVariants(
+  original
+) {
+  const variants = [];
 
-console.log("Baixando M3U...");
+  try {
+    const originalUrl =
+      new URL(
+        original
+      );
 
-const response = await fetch(M3U_URL, {
-  headers: {
-    accept: "audio/x-mpegurl,text/plain,*/*",
-    "user-agent": "Eagle-Click-Index/3.0"
-  }
-});
+    variants.push(
+      originalUrl.toString()
+    );
 
-if (!response.ok) {
-  throw new Error(`M3U HTTP ${response.status}`);
-}
+    /*
+     * HTTPS
+     */
+    if (
+      originalUrl.protocol ===
+      "http:"
+    ) {
+      const https =
+        new URL(
+          originalUrl.toString()
+        );
 
-const playlist = await response.text();
-console.log(`M3U recebida: ${(playlist.length / 1024 / 1024).toFixed(1)} MB`);
+      https.protocol =
+        "https:";
 
-await rm(OUTPUT_DIR, { recursive: true, force: true });
-await mkdir(join(OUTPUT_DIR, "shards"), { recursive: true });
+      variants.push(
+        https.toString()
+      );
+    }
 
-const phraseMaps = Array.from({ length: SHARD_COUNT }, () => new Map());
-const tokenMaps = Array.from({ length: SHARD_COUNT }, () => new Map());
-const idMaps = Array.from({ length: SHARD_COUNT }, () => new Map());
+    /*
+     * Remove output.
+     */
+    const noOutput =
+      new URL(
+        originalUrl.toString()
+      );
 
-const catalog = [];
-const seenIds = new Set();
+    noOutput.searchParams.delete(
+      "output"
+    );
 
-let current = null;
-let total = 0;
-let movies = 0;
+    variants.push(
+      noOutput.toString()
+    );
 
-const lines = playlist.split(/\r?\n/);
+    /*
+     * MPEGTS.
+     */
+    const mpegts =
+      new URL(
+        originalUrl.toString()
+      );
 
-for (const rawLine of lines) {
-  const line = rawLine.trim();
-  if (!line) continue;
+    mpegts.searchParams.set(
+      "output",
+      "mpegts"
+    );
 
-  if (line.toUpperCase().startsWith("#EXTINF:")) {
-    current = parseExtinf(line);
-    continue;
-  }
+    variants.push(
+      mpegts.toString()
+    );
 
-  if (line.startsWith("#")) continue;
-  if (!current) continue;
+    /*
+     * M3U8.
+     */
+    const m3u8 =
+      new URL(
+        originalUrl.toString()
+      );
 
-  const pathInfo = extractPathInfo(line);
-  if (!pathInfo) {
-    current = null;
-    continue;
-  }
+    m3u8.searchParams.set(
+      "output",
+      "m3u8"
+    );
 
-  const name = current.name || "Filme";
-  const key = normalizeCore(name);
-  if (!key) {
-    current = null;
-    continue;
-  }
+    variants.push(
+      m3u8.toString()
+    );
 
-  const record = compactRecord({
-    id: pathInfo.id,
-    name,
-    poster: current.poster,
-    quality: qualityOf(name),
-    audio: audioOf(name),
-    extension: pathInfo.extension,
-    year: yearOf(name)
-  });
+    /*
+     * TS.
+     */
+    const ts =
+      new URL(
+        originalUrl.toString()
+      );
 
-  total++;
-  movies++;
+    ts.searchParams.set(
+      "output",
+      "ts"
+    );
 
-  if (seenIds.has(record.i)) {
-    current = null;
-    continue;
-  }
+    variants.push(
+      ts.toString()
+    );
 
-  seenIds.add(record.i);
-
-  const phraseShard = fnv1a(key) & 0xff;
-  addToMapOfArrays(
-    phraseMaps[phraseShard],
-    key,
-    record
-  );
-
-  const tokens = key
-    .split(" ")
-    .filter(x => x && x.length >= 3 && !STOP_WORDS.has(x));
-
-  for (const token of new Set(tokens)) {
-    const tokenShard = fnv1a(token) & 0xff;
-    addToMapOfArrays(
-      tokenMaps[tokenShard],
-      token,
-      record,
-      MAX_TOKEN_ITEMS
+  } catch (_) {
+    variants.push(
+      original
     );
   }
 
-  const idShard = fnv1a(record.i) & 0xff;
-  idMaps[idShard].set(record.i, record);
-
-  if (catalog.length < 100) {
-    catalog.push(record);
-  }
-
-  current = null;
+  return [
+    ...new Set(
+      variants
+    )
+  ];
 }
 
-function sortRecordList(a, b) {
-  const qa = a.q === "4K" ? 4 : a.q === "1080p" ? 3 : a.q === "720p" ? 2 : 1;
-  const qb = b.q === "4K" ? 4 : b.q === "1080p" ? 3 : b.q === "720p" ? 2 : 1;
-  if (qa !== qb) return qb - qa;
-  return String(a.n).localeCompare(String(b.n), "pt-BR");
-}
+/* =========================================================
+   DOWNLOAD
+========================================================= */
 
-for (let shardIndex = 0; shardIndex < SHARD_COUNT; shardIndex++) {
-  const p = {};
-  const t = {};
-  const i = {};
+async function downloadM3U() {
+  const variants =
+    makeUrlVariants(
+      M3U_URL
+    );
 
-  for (const [key, list] of phraseMaps[shardIndex]) {
-    p[key] = list.sort(sortRecordList);
+  const userAgents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36",
+    "VLC/3.0.21 LibVLC/3.0.21",
+    "curl/8.5.0"
+  ];
+
+  let lastError =
+    null;
+
+  for (
+    let round = 0;
+    round <
+      MAX_M3U_RETRIES;
+    round++
+  ) {
+    const url =
+      variants[
+        round %
+          variants.length
+      ];
+
+    const userAgent =
+      userAgents[
+        round %
+          userAgents.length
+      ];
+
+    console.log(
+      `Tentativa ${round + 1}/${MAX_M3U_RETRIES}`
+    );
+
+    console.log(
+      `Endpoint: ${new URL(url).origin}/get.php`
+    );
+
+    try {
+      const controller =
+        new AbortController();
+
+      const timer =
+        setTimeout(
+          () =>
+            controller.abort(),
+          120000
+        );
+
+      const response =
+        await fetch(
+          url,
+          {
+            method:
+              "GET",
+            redirect:
+              "follow",
+            headers: {
+              accept:
+                "application/x-mpegURL,audio/x-mpegurl,text/plain,*/*",
+              "user-agent":
+                userAgent,
+              connection:
+                "keep-alive"
+            },
+            signal:
+              controller.signal
+          }
+        );
+
+      clearTimeout(
+        timer
+      );
+
+      console.log(
+        `HTTP ${response.status}`
+      );
+
+      if (
+        response.ok
+      ) {
+        const body =
+          await response.text();
+
+        if (
+          body &&
+          (
+            body.includes(
+              "#EXTM3U"
+            ) ||
+            body.includes(
+              "#EXTINF:"
+            )
+          )
+        ) {
+          console.log(
+            `M3U recebida: ${body.length} bytes`
+          );
+
+          return body;
+        }
+
+        console.log(
+          `Resposta HTTP ${response.status}, mas não parece M3U.`
+        );
+
+        console.log(
+          `Início da resposta: ${body.slice(0, 500)}`
+        );
+
+        lastError =
+          new Error(
+            "Resposta não parece uma playlist M3U."
+          );
+      } else {
+        let body =
+          "";
+
+        try {
+          body =
+            await response.text();
+        } catch (_) {}
+
+        console.log(
+          `Corpo do erro: ${body.slice(0, 1000)}`
+        );
+
+        lastError =
+          new Error(
+            `M3U HTTP ${response.status}: ${body.slice(0, 500)}`
+          );
+      }
+    } catch (error) {
+      lastError =
+        error;
+
+      console.log(
+        `Erro de conexão: ${String(error?.message || error)}`
+      );
+    }
+
+    if (
+      round <
+      MAX_M3U_RETRIES - 1
+    ) {
+      const wait =
+        3000 *
+        (round + 1);
+
+      console.log(
+        `Aguardando ${wait} ms antes da próxima tentativa...`
+      );
+
+      await sleep(
+        wait
+      );
+    }
   }
 
-  for (const [key, list] of tokenMaps[shardIndex]) {
-    t[key] = list.sort(sortRecordList);
-  }
-
-  for (const [key, record] of idMaps[shardIndex]) {
-    i[key] = record;
-  }
-
-  const content = JSON.stringify({ p, t, i });
-  await writeFile(
-    join(OUTPUT_DIR, "shards", `${shardIndex.toString(16).padStart(2, "0")}.json`),
-    content
+  throw (
+    lastError ||
+    new Error(
+      "Não foi possível baixar a M3U."
+    )
   );
 }
 
-await writeFile(
-  join(OUTPUT_DIR, "manifest.json"),
-  JSON.stringify(
+/* =========================================================
+   PARSE M3U
+========================================================= */
+
+function parseM3U(
+  content
+) {
+  const lines =
+    String(
+      content || ""
+    ).split(
+      /\r?\n/
+    );
+
+  const entries =
+    [];
+
+  let current =
+    null;
+
+  let totalLines =
+    lines.length;
+
+  let movieCount =
+    0;
+
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+    const line =
+      lines[i].trim();
+
+    if (!line) {
+      continue;
+    }
+
+    if (
+      line
+        .toUpperCase()
+        .startsWith(
+          "#EXTINF:"
+        )
+    ) {
+      current =
+        parseExtInf(
+          line
+        );
+
+      continue;
+    }
+
+    if (
+      line.startsWith(
+        "#"
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !current
+    ) {
+      continue;
+    }
+
+    const streamUrl =
+      line;
+
+    /*
+     * Só filmes.
+     */
+    if (
+      !/\/movie\//i.test(
+        streamUrl
+      )
+    ) {
+      current =
+        null;
+
+      continue;
+    }
+
+    if (
+      !current.name
+    ) {
+      current =
+        null;
+
+      continue;
+    }
+
+    const id =
+      extractStreamId(
+        streamUrl
+      );
+
+    const quality =
+      qualityLabel(
+        current.name
+      );
+
+    const audio =
+      audioLabel(
+        current.name
+      );
+
+    const normalized =
+      normalizeSearch(
+        current.name
+      );
+
+    const tokens =
+      getTokens(
+        current.name
+      );
+
+    const year =
+      extractYear(
+        current.name
+      );
+
+    const record = {
+      i:
+        String(id),
+      n:
+        current.name,
+      o:
+        current.tvgName ||
+        "",
+      k:
+        normalized,
+      z:
+        tokens,
+      p:
+        current.logo ||
+        "",
+      q:
+        quality ||
+        "",
+      a:
+        audio ||
+        "",
+      e:
+        (
+          streamUrl.match(
+            /\.([a-zA-Z0-9]+)(?:\?|$)/
+          )?.[1]
+        ) ||
+        "mp4",
+      y:
+        year ||
+        "",
+      g:
+        current.group ||
+        ""
+    };
+
+    entries.push(
+      record
+    );
+
+    movieCount++;
+
+    current =
+      null;
+
+    if (
+      movieCount %
+        10000 ===
+      0
+    ) {
+      console.log(
+        `Filmes processados: ${movieCount}`
+      );
+    }
+  }
+
+  console.log(
+    `Linhas lidas: ${totalLines}`
+  );
+
+  console.log(
+    `Filmes encontrados: ${movieCount}`
+  );
+
+  return entries;
+}
+
+/* =========================================================
+   BUILD INDEX
+========================================================= */
+
+function addToArrayMap(
+  map,
+  key,
+  record
+) {
+  if (!key) {
+    return;
+  }
+
+  let arr =
+    map[key];
+
+  if (!arr) {
+    arr = [];
+    map[key] =
+      arr;
+  }
+
+  arr.push(
+    record
+  );
+}
+
+async function buildIndex(
+  entries
+) {
+  await fs.rm(
+    OUTPUT_DIR,
     {
-      version: "3.0.0",
-      generatedAt: new Date().toISOString(),
-      totalEntries: total,
-      movies,
-      shardCount: SHARD_COUNT,
-      format: "eagle-click-index-v1"
-    },
-    null,
-    2
-  )
+      recursive:
+        true,
+      force:
+        true
+    }
+  );
+
+  await fs.mkdir(
+    SHARDS_DIR,
+    {
+      recursive:
+        true
+    }
+  );
+
+  /*
+   * Inicializa 256 shards.
+   *
+   * Cada shard contém:
+   *
+   * p = phrase index
+   * t = token index
+   * i = ID lookup
+   */
+  const shards =
+    new Map();
+
+  for (
+    let i = 0;
+    i < 256;
+    i++
+  ) {
+    const shard =
+      i.toString(16)
+        .padStart(
+          2,
+          "0"
+        );
+
+    shards.set(
+      shard,
+      {
+        p: {},
+        t: {},
+        i: {}
+      }
+    );
+  }
+
+  const catalog =
+    [];
+
+  for (
+    let i = 0;
+    i < entries.length;
+    i++
+  ) {
+    const record =
+      entries[i];
+
+    /*
+     * Compact record para o índice.
+     */
+    const compact = {
+      i:
+        record.i,
+      n:
+        record.n,
+      o:
+        record.o,
+      p:
+        record.p,
+      q:
+        record.q,
+      a:
+        record.a,
+      e:
+        record.e,
+      y:
+        record.y
+    };
+
+    catalog.push(
+      compact
+    );
+
+    /*
+     * ----------------
+     * ID SHARD
+     * ----------------
+     */
+    const idShard =
+      shards.get(
+        shardFor(
+          record.i
+        )
+      );
+
+    idShard.i[
+      record.i
+    ] = compact;
+
+    /*
+     * ----------------
+     * PHRASE
+     * ----------------
+     */
+    if (
+      record.k
+    ) {
+      const phraseShard =
+        shards.get(
+          shardFor(
+            record.k
+          )
+        );
+
+      addToArrayMap(
+        phraseShard.p,
+        record.k,
+        compact
+      );
+    }
+
+    /*
+     * ----------------
+     * TOKENS
+     * ----------------
+     */
+    for (
+      const token
+      of record.z
+    ) {
+      const tokenShard =
+        shards.get(
+          shardFor(
+            token
+          )
+        );
+
+      addToArrayMap(
+        tokenShard.t,
+        token,
+        compact
+      );
+    }
+  }
+
+  /*
+   * Deduplica arrays.
+   */
+  for (
+    const [
+      shardName,
+      shard
+    ]
+    of shards
+  ) {
+    for (
+      const key
+      of Object.keys(
+        shard.p
+      )
+    ) {
+      shard.p[key] =
+        dedupeCompact(
+          shard.p[key]
+        );
+    }
+
+    for (
+      const key
+      of Object.keys(
+        shard.t
+      )
+    ) {
+      shard.t[key] =
+        dedupeCompact(
+          shard.t[key]
+        );
+    }
+
+    await fs.writeFile(
+      path.join(
+        SHARDS_DIR,
+        `${shardName}.json`
+      ),
+      JSON.stringify(
+        shard
+      ),
+      "utf8"
+    );
+  }
+
+  /*
+   * ----------------
+   * CATALOG
+   * ----------------
+   */
+
+  await fs.writeFile(
+    path.join(
+      OUTPUT_DIR,
+      "catalog.json"
+    ),
+    JSON.stringify(
+      {
+        items:
+          catalog
+            .slice(
+              0,
+              100
+            )
+      }
+    ),
+    "utf8"
+  );
+
+  /*
+   * ----------------
+   * MANIFEST
+   * ----------------
+   */
+
+  const manifest = {
+    version:
+      "3.0.0",
+    generatedAt:
+      new Date().toISOString(),
+    totalEntries:
+      entries.length,
+    shards:
+      256,
+    source:
+      "sventank"
+  };
+
+  await fs.writeFile(
+    path.join(
+      OUTPUT_DIR,
+      "manifest.json"
+    ),
+    JSON.stringify(
+      manifest,
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  /*
+   * Informações extras para debug.
+   */
+  await fs.writeFile(
+    path.join(
+      OUTPUT_DIR,
+      "build-info.json"
+    ),
+    JSON.stringify(
+      {
+        generatedAt:
+          new Date().toISOString(),
+        totalEntries:
+          entries.length,
+        sourceHost:
+          normalizeBaseUrl(
+            M3U_URL
+          )
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  console.log(
+    "========================================"
+  );
+
+  console.log(
+    "ÍNDICE GERADO COM SUCESSO"
+  );
+
+  console.log(
+    `Total de filmes: ${entries.length}`
+  );
+
+  console.log(
+    `Diretório: ${OUTPUT_DIR}`
+  );
+
+  console.log(
+    "========================================"
+  );
+}
+
+function dedupeCompact(
+  records
+) {
+  const map =
+    new Map();
+
+  for (
+    const record
+    of records
+  ) {
+    if (
+      !record?.i
+    ) {
+      continue;
+    }
+
+    if (
+      !map.has(
+        record.i
+      )
+    ) {
+      map.set(
+        record.i,
+        record
+      );
+    }
+  }
+
+  return [
+    ...map.values()
+  ];
+}
+
+/* =========================================================
+   MAIN
+========================================================= */
+
+console.log(
+  "========================================"
 );
 
-await writeFile(
-  join(OUTPUT_DIR, "catalog.json"),
-  JSON.stringify({
-    version: "3.0.0",
-    generatedAt: new Date().toISOString(),
-    items: catalog
-  })
+console.log(
+  "Eagle Click Index Builder"
 );
 
-console.log(`Itens VOD processados: ${total}`);
-console.log(`IDs únicos: ${seenIds.size}`);
-console.log(`Shards escritos: ${SHARD_COUNT}`);
+console.log(
+  "========================================"
+);
+
+console.log(
+  "Baixando M3U..."
+);
+
+const m3u =
+  await downloadM3U();
+
+console.log(
+  "Processando M3U..."
+);
+
+const entries =
+  parseM3U(
+    m3u
+  );
+
+console.log(
+  "Construindo índice..."
+);
+
+await buildIndex(
+  entries
+);
+
+console.log(
+  "Finalizado."
+);
